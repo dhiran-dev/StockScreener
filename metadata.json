@@ -1,0 +1,6 @@
+
+{
+  "name": "NSE AlphaScreener",
+  "description": "Professional-grade NSE stock screener and chart viewer. Detects institutional Order Blocks (OB) and Volatility Contraction Patterns (VCP) to identify high-probability A+ swing trading setups with AI-powered trade rationales.",
+  "requestFramePermissions": []
+}
