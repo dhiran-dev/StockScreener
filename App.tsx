@@ -4,11 +4,12 @@ import { OHLC, StockAnalysis, StrategyID, StockMetadata, Bookmark } from './type
 import { NSE_WATCHLIST, INDUSTRIES, INDICES } from './utils/mockData';
 import { detectOrderBlocks, detectVCP, calculateStrategyScore, calculateFundamentalScore } from './utils/analysis';
 import { getTradeRationale } from './services/geminiService';
-import { fetchStockData } from './utils/dataService';
+import { fetchStockData, getUsageStats } from './utils/dataService';
+import { storageService } from './utils/storageService';
 import StockChart from './components/StockChart';
 import HelpModal from './components/HelpModal';
 
-type AppStep = 'landing' | 'scanning' | 'results';
+type AppStep = 'landing' | 'scanning' | 'results' | 'syncing';
 type SidebarView = 'market' | 'bookmarks';
 
 interface Strategy {
@@ -54,7 +55,28 @@ const App: React.FC = () => {
   const [isAiLoading, setIsAiLoading] = useState(false);
   const [chartDataCache, setChartDataCache] = useState<Record<string, OHLC[]>>({});
 
+  const [dbLastUpdated, setDbLastUpdated] = useState<number | null>(null);
+  const [syncProgress, setSyncProgress] = useState(0);
+  const [syncStatus, setSyncStatus] = useState("");
+  const [usageStats, setUsageStats] = useState(getUsageStats());
+
   const hasApiKey = !!process.env.API_KEY && process.env.API_KEY !== 'undefined' && process.env.API_KEY.trim() !== '';
+
+  useEffect(() => {
+    const interval = setInterval(() => {
+      setUsageStats(getUsageStats());
+    }, 5000);
+    return () => clearInterval(interval);
+  }, []);
+
+  const loadMetadata = async () => {
+    const updated = await storageService.getMetadata('lastUpdated');
+    setDbLastUpdated(updated);
+  };
+
+  useEffect(() => {
+    loadMetadata();
+  }, []);
 
   // Load bookmarks on init
   useEffect(() => {
@@ -126,8 +148,16 @@ const App: React.FC = () => {
     for (let i = 0; i < filteredWatchlist.length; i++) {
       const meta = filteredWatchlist[i];
       setCurrentScanningSymbol(meta.symbol);
+      
       try {
-        const data = await fetchStockData(meta.symbol);
+        // Load from storage instead of fetching from network
+        const data = await storageService.getStockData(meta.symbol);
+        
+        if (!data || data.length === 0) {
+          console.warn(`No local data for ${meta.symbol}, skipping.`);
+          continue;
+        }
+
         cache[meta.symbol] = data;
         
         const obs = detectOrderBlocks(data);
@@ -150,7 +180,7 @@ const App: React.FC = () => {
         analysis.score = calculateStrategyScore(analysis, currentPrice, selectedStrategy.id);
         results.push(analysis);
       } catch (err) {
-        console.warn(`Error scanning ${meta.symbol}`);
+        console.warn(`Error analyzing ${meta.symbol}`);
       }
       setScanningProgress(Math.round(((i + 1) / filteredWatchlist.length) * 100));
     }
@@ -159,6 +189,38 @@ const App: React.FC = () => {
     setChartDataCache(cache);
     if (results.length > 0) setSelectedSymbol(results[0].symbol);
     setStep('results');
+  };
+
+  const handleSync = async () => {
+    setStep('syncing');
+    setSyncProgress(0);
+    
+    // Sync all available symbols, or just the Nifty lists
+    const total = NSE_WATCHLIST.length;
+    let successCount = 0;
+
+    for (let i = 0; i < total; i++) {
+      const stock = NSE_WATCHLIST[i];
+      setSyncStatus(`Syncing ${stock.symbol} (${i + 1}/${total})`);
+      
+      try {
+        const data = await fetchStockData(stock.symbol);
+        await storageService.saveStockData(stock.symbol, data);
+        successCount++;
+      } catch (err) {
+        console.error(`Failed to sync ${stock.symbol}`);
+      }
+      
+      setSyncProgress(Math.round(((i + 1) / total) * 100));
+      // Inter-request delay for Yahoo health - slowed to 1.1s for 60 req/min safety
+      await new Promise(resolve => setTimeout(resolve, 1100)); 
+    }
+
+    const timestamp = Date.now();
+    await storageService.saveMetadata('lastUpdated', timestamp);
+    setDbLastUpdated(timestamp);
+    alert(`Sync Complete! Successfully updated ${successCount} symbols.`);
+    setStep('landing');
   };
 
   const currentAnalysis = useMemo(() => 
@@ -275,14 +337,74 @@ const App: React.FC = () => {
                 </label>
               </div>
 
-              <div className="pt-4">
+              <div className="pt-4 space-y-4">
                 <button
                   onClick={startScan}
                   className="w-full bg-emerald-500 hover:bg-emerald-400 text-slate-950 font-black py-5 rounded-3xl text-xl shadow-2xl shadow-emerald-500/20 transition-all flex items-center justify-center gap-4"
                 >
-                  Scan {filteredWatchlist.length} Symbols
+                  Quick Scan {filteredWatchlist.length} Stocks
                   <svg className="w-6 h-6" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={3} d="M14 5l7 7m0 0l-7 7m7-7H3" /></svg>
                 </button>
+
+                <div className="bg-slate-950/50 border border-slate-800 rounded-3xl p-6 flex flex-col items-center gap-4">
+                  <div className="text-center">
+                    <p className="text-[10px] font-black text-slate-500 uppercase tracking-widest mb-1">Local Database</p>
+                    <p className="text-xs font-bold text-slate-300">
+                      {dbLastUpdated ? `Last Sync: ${new Date(dbLastUpdated).toLocaleString()}` : "No local data available"}
+                    </p>
+                  </div>
+                  <button
+                    onClick={handleSync}
+                    className="w-full bg-slate-900 hover:bg-slate-800 text-white font-bold py-3 px-6 rounded-2xl border border-slate-800 transition-all text-sm flex items-center justify-center gap-2"
+                  >
+                    <svg className="w-4 h-4 text-sky-400" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" /></svg>
+                    Sync Offline Data
+                  </button>
+
+                  <div className="w-full bg-slate-950/50 border border-slate-800 rounded-2xl p-4 space-y-4">
+                    <div className="flex justify-between items-center text-[10px] font-black uppercase tracking-widest text-slate-500">
+                      <span>Smart Data Strategy</span>
+                      <span className={usageStats.daily > 7000 ? 'text-red-500' : 'text-emerald-500'}>Active</span>
+                    </div>
+
+                    <div className="space-y-3">
+                      <div className="flex items-center gap-3">
+                        <div className="p-2 bg-emerald-500/10 rounded-lg">
+                          <svg className="w-4 h-4 text-emerald-400" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 12l2 2 4-4m5.618-4.016A11.955 11.955 0 0112 2.944a11.955 11.955 0 01-8.618 3.04A12.02 12.02 0 003 9c0 5.591 3.824 10.29 9 11.622 5.176-1.332 9-6.03 9-11.622 0-1.042-.133-2.052-.382-3.016z" /></svg>
+                        </div>
+                        <div>
+                          <p className="text-[10px] font-black text-white">Browser Masquerading</p>
+                          <p className="text-[9px] text-slate-500">Injecting real browser headers (User-Agent) to avoid anti-bot filters.</p>
+                        </div>
+                      </div>
+
+                      <div className="flex items-center gap-3">
+                        <div className="p-2 bg-sky-500/10 rounded-lg">
+                          <svg className="w-4 h-4 text-sky-400" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z" /></svg>
+                        </div>
+                        <div>
+                          <p className="text-[10px] font-black text-white">Quota-Aware Sync</p>
+                          <p className="text-[9px] text-slate-500">Throttled to 1.1s intervals. Adheres to 60/min & 8k/day Yahoo DSP limits.</p>
+                        </div>
+                      </div>
+                    </div>
+
+                    <div className="grid grid-cols-3 gap-2">
+                       <div className="text-center p-2 bg-slate-900 rounded-xl border border-slate-800">
+                          <p className="text-[10px] font-bold text-slate-500">Min</p>
+                          <p className={`text-sm font-black ${usageStats.minute > 50 ? 'text-amber-500' : 'text-white'}`}>{usageStats.minute}/60</p>
+                       </div>
+                       <div className="text-center p-2 bg-slate-900 rounded-xl border border-slate-800">
+                          <p className="text-[10px] font-bold text-slate-500">Hour</p>
+                          <p className={`text-sm font-black ${usageStats.hourly > 300 ? 'text-amber-500' : 'text-white'}`}>{usageStats.hourly}/360</p>
+                       </div>
+                       <div className="text-center p-2 bg-slate-900 rounded-xl border border-slate-800">
+                          <p className="text-[10px] font-bold text-slate-500">Day</p>
+                          <p className={`text-sm font-black ${usageStats.daily > 7000 ? 'text-amber-500' : 'text-white'}`}>{usageStats.daily}/8k</p>
+                       </div>
+                    </div>
+                  </div>
+                </div>
               </div>
             </div>
           </div>
@@ -296,8 +418,28 @@ const App: React.FC = () => {
       <div className="h-screen flex items-center justify-center bg-slate-950">
         <div className="text-center">
           <div className="w-32 h-32 border-8 border-slate-900 border-t-emerald-500 rounded-full animate-spin mx-auto mb-8"></div>
-          <h2 className="text-4xl font-black mb-2 tracking-tighter">{scanningProgress}%</h2>
-          <p className="text-slate-500 font-bold uppercase tracking-widest text-xs">Analyzing {currentScanningSymbol}...</p>
+          <h2 className="text-4xl font-black mb-2 tracking-tighter text-white">{scanningProgress}%</h2>
+          <p className="text-slate-500 font-bold uppercase tracking-widest text-xs">Offline Analysis: {currentScanningSymbol}...</p>
+        </div>
+      </div>
+    );
+  }
+
+  if (step === 'syncing') {
+    return (
+      <div className="h-screen flex items-center justify-center bg-slate-950">
+        <div className="text-center max-w-md w-full px-8">
+          <div className="w-32 h-32 border-8 border-slate-950 border-t-sky-500 rounded-full animate-[spin_3s_linear_infinite] mx-auto mb-10 relative">
+             <div className="absolute inset-4 border-4 border-slate-900 border-b-sky-500/30 rounded-full animate-[spin_1s_linear_infinite_reverse]"></div>
+          </div>
+          <h2 className="text-6xl font-black mb-4 tracking-tighter text-white">{syncProgress}%</h2>
+          <div className="bg-slate-900/50 border border-slate-800 rounded-2xl p-4 mb-4">
+             <p className="text-sky-400 font-bold uppercase tracking-[0.2em] text-[10px] mb-1">Background Syncing</p>
+             <p className="text-slate-300 font-medium">{syncStatus}</p>
+          </div>
+          <p className="text-slate-500 text-xs leading-relaxed italic">
+            "We're pulling 200+ NSE symbols into your local browser database. This ensures your scans are near-instant and avoids network errors."
+          </p>
         </div>
       </div>
     );
